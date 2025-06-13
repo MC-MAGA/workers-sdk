@@ -12,6 +12,7 @@ import {
 } from "../../dev";
 import { getClassNamesWhichUseSQLite } from "../../dev/class-names-sqlite";
 import { getLocalPersistencePath } from "../../dev/get-local-persistence-path";
+import { getDockerPath } from "../../environment-variables/misc-variables";
 import { UserError } from "../../errors";
 import { getFlag } from "../../experimental-flags";
 import { logger, runWithLogLevel } from "../../logger";
@@ -127,12 +128,15 @@ async function resolveDevConfig(
 			httpsKeyPath: input.dev?.server?.httpsKeyPath,
 			httpsCertPath: input.dev?.server?.httpsCertPath,
 		},
-		inspector: {
-			port:
-				input.dev?.inspector?.port ??
-				config.dev.inspector_port ??
-				(await getInspectorPort()),
-		},
+		inspector:
+			input.dev?.inspector === false
+				? false
+				: {
+						port:
+							input.dev?.inspector?.port ??
+							config.dev.inspector_port ??
+							(await getInspectorPort()),
+					},
 		origin: {
 			secure:
 				input.dev?.origin?.secure ?? config.dev.upstream_protocol === "https",
@@ -148,6 +152,9 @@ async function resolveDevConfig(
 		imagesLocalMode: input.dev?.imagesLocalMode ?? false,
 		experimentalMixedMode:
 			input.dev?.experimentalMixedMode ?? getFlag("MIXED_MODE"),
+		enableContainers:
+			input.dev?.enableContainers ?? config.dev.enable_containers,
+		dockerPath: input.dev?.dockerPath ?? getDockerPath(),
 	} satisfies StartDevWorkerOptions["dev"];
 }
 
@@ -431,7 +438,7 @@ function resolveContainerConfig(
 			image: container.image ?? container.configuration.image,
 			maxInstances: container.max_instances,
 			imageBuildContext: container.image_build_context,
-			exposedPorts: container.dev_exposed_ports,
+			name: container.name,
 		};
 	}
 	return containers;
