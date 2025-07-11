@@ -17,6 +17,7 @@ import { logger } from "../logger";
 import * as metrics from "../metrics";
 import { isNavigatorDefined } from "../navigator-user-agent";
 import { getBasePath } from "../paths";
+import { debounce } from "../utils/debounce";
 import * as shellquote from "../utils/shell-quote";
 import { buildFunctions } from "./buildFunctions";
 import { ROUTES_SPEC_VERSION, SECONDS_TO_WAIT_FOR_PROXY } from "./constants";
@@ -27,7 +28,7 @@ import {
 	produceWorkerBundleForWorkerJSDirectory,
 } from "./functions/buildWorker";
 import { validateRoutes } from "./functions/routes-validation";
-import { CLEANUP, CLEANUP_CALLBACKS, debounce, getPagesTmpDir } from "./utils";
+import { CLEANUP, CLEANUP_CALLBACKS, getPagesTmpDir } from "./utils";
 import type { Config } from "../config";
 import type {
 	DurableObjectBindings,
@@ -882,7 +883,7 @@ export const pagesDevCommand = createCommand({
 			{
 				MULTIWORKER: Array.isArray(args.config),
 				RESOURCES_PROVISION: false,
-				MIXED_MODE: false,
+				REMOTE_BINDINGS: false,
 			},
 			() =>
 				startDev({
@@ -948,7 +949,7 @@ export const pagesDevCommand = createCommand({
 					persistTo: args.persistTo,
 					logLevel: args.logLevel ?? "log",
 					experimentalProvision: undefined,
-					experimentalMixedMode: false,
+					experimentalRemoteBindings: false,
 					experimentalVectorizeBindToProd: false,
 					experimentalImagesLocalMode: false,
 					enableIpc: true,
@@ -956,6 +957,7 @@ export const pagesDevCommand = createCommand({
 					site: undefined,
 					siteInclude: undefined,
 					siteExclude: undefined,
+					enableContainers: false,
 				})
 		);
 

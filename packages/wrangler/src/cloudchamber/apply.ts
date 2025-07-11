@@ -1,5 +1,8 @@
+/**
+ * Important! You are probably looking for containers/deploy.ts!
+ * This is used for cloudchamber apply, but has been duplicated and modified in containers/deploy.ts to deploy containers during wrangler deploy.
+ */
 import {
-	cancel,
 	endSection,
 	log,
 	logRaw,
@@ -8,25 +11,33 @@ import {
 	success,
 	updateStatus,
 } from "@cloudflare/cli";
-import { processArgument } from "@cloudflare/cli/args";
 import { bold, brandColor, dim, green, red } from "@cloudflare/cli/colors";
-import { formatConfigSnippet } from "../config";
-import { UserError } from "../errors";
 import {
 	ApiError,
 	ApplicationsService,
 	CreateApplicationRolloutRequest,
 	DeploymentMutationError,
+	InstanceType,
+	resolveImageName,
 	RolloutsService,
 	SchedulingPolicy,
-} from "./client";
-import { promiseSpinner } from "./common";
-import { diffLines } from "./helpers/diff";
+} from "@cloudflare/containers-shared";
+import { formatConfigSnippet } from "../config";
+import { FatalError, UserError } from "../errors";
+import { getAccountId } from "../user";
+import { cleanForInstanceType, promiseSpinner } from "./common";
+import {
+	createLine,
+	diffLines,
+	printLine,
+	sortObjectRecursive,
+	stripUndefined,
+} from "./helpers/diff";
 import type { Config } from "../config";
-import type { ContainerApp } from "../config/environment";
+import type { ContainerApp, Observability } from "../config/environment";
 import type {
-	CommonYargsArgvJSON,
-	StrictYargsOptionsToInterfaceJSON,
+	CommonYargsArgv,
+	StrictYargsOptionsToInterface,
 } from "../yargs-types";
 import type {
 	Application,
@@ -35,8 +46,9 @@ import type {
 	CreateApplicationRequest,
 	ModifyApplicationRequestBody,
 	ModifyDeploymentV2RequestBody,
+	Observability as ObservabilityConfiguration,
 	UserDeploymentConfiguration,
-} from "./client";
+} from "@cloudflare/containers-shared";
 import type { JsonMap } from "@iarna/toml";
 
 function mergeDeep<T>(target: T, source: Partial<T>): T {
@@ -68,7 +80,7 @@ function isObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function applyCommandOptionalYargs(yargs: CommonYargsArgvJSON) {
+export function applyCommandOptionalYargs(yargs: CommonYargsArgv) {
 	return yargs.option("skip-defaults", {
 		requiresArg: true,
 		type: "boolean",
@@ -91,10 +103,14 @@ function createApplicationToModifyApplication(
 }
 
 function applicationToCreateApplication(
+	accountId: string,
 	application: Application
 ): CreateApplicationRequest {
 	const app: CreateApplicationRequest = {
-		configuration: application.configuration,
+		configuration: {
+			...application.configuration,
+			image: resolveImageName(accountId, application.configuration.image),
+		},
 		constraints: application.constraints,
 		max_instances: application.max_instances,
 		name: application.name,
@@ -108,19 +124,126 @@ function applicationToCreateApplication(
 	return app;
 }
 
-function containerAppToCreateApplication(
-	containerApp: ContainerApp,
-	skipDefaults = false
-): CreateApplicationRequest {
+function cleanupObservability(
+	observability: ObservabilityConfiguration | undefined
+) {
+	if (observability === undefined) {
+		return;
+	}
+
+	// `logging` field is deprecated, so if the server returns both `logging` and `logs`
+	// fields, drop the `logging` one.
+	if (observability.logging !== undefined && observability.logs !== undefined) {
+		delete observability.logging;
+	}
+}
+
+function observabilityToConfiguration(
+	observability: Observability | undefined,
+	existingObservabilityConfig: ObservabilityConfiguration | undefined
+): ObservabilityConfiguration | undefined {
+	// Let's use logs for the sake of simplicity of explanation.
+	//
+	// The first column specifies if logs are enabled in the current Wrangler config.
+	// The second column specifies if logs are currently enabled for the application.
+	// The third column specifies what the expected function result should be so that
+	// diff is minimal.
+	//
+	// | Wrangler  | Existing  | Result    |
+	// | --------- | --------- | --------- |
+	// | undefined | undefined | undefined |
+	// | undefined | false     | false     |
+	// | undefined | true      | false     |
+	// | false     | undefined | undefined |
+	// | false     | false     | false     |
+	// | false     | true      | false     |
+	// | true      | undefined | true      |
+	// | true      | false     | true      |
+	// | true      | true      | true      |
+	//
+	// Because the result is the same for Wrangler undefined and false, the table may be
+	// compressed as follows:
+
+	//
+	// | Wrangler          | Existing                 | Result    |
+	// | ----------------- | ------------------------ | --------- |
+	// | false / undefined | undefined                | undefined |
+	// | false / undefined | false / true             | false     |
+	// | true              | undefined / false / true | true      |
+
+	const observabilityLogsEnabled =
+		observability?.logs?.enabled === true ||
+		(observability?.enabled === true && observability?.logs?.enabled !== false);
+	const logsAlreadyEnabled = existingObservabilityConfig?.logs?.enabled;
+
+	if (observabilityLogsEnabled) {
+		return { logs: { enabled: true } };
+	} else {
+		if (logsAlreadyEnabled === undefined) {
+			return undefined;
+		} else {
+			return { logs: { enabled: false } };
+		}
+	}
+}
+
+function containerAppToInstanceType(
+	containerApp: ContainerApp
+): InstanceType | undefined {
+	if (containerApp.instance_type !== undefined) {
+		return containerApp.instance_type as InstanceType;
+	}
+
+	// if no other configuration is set, we fall back to the default "dev" instance type
 	const configuration =
 		containerApp.configuration as UserDeploymentConfiguration;
+	if (
+		configuration.disk === undefined &&
+		configuration.vcpu === undefined &&
+		configuration.memory === undefined &&
+		configuration.memory_mib === undefined
+	) {
+		return InstanceType.DEV;
+	}
+}
+
+function containerAppToCreateApplication(
+	accountId: string,
+	containerApp: ContainerApp,
+	observability: Observability | undefined,
+	existingApp: Application | undefined,
+	skipDefaults = false
+): CreateApplicationRequest {
+	const observabilityConfiguration = observabilityToConfiguration(
+		observability,
+		existingApp?.configuration.observability
+	);
+	const instanceType = containerAppToInstanceType(containerApp);
+	const configuration: UserDeploymentConfiguration = {
+		...(containerApp.configuration as UserDeploymentConfiguration),
+		observability: observabilityConfiguration,
+		instance_type: instanceType,
+	};
+
+	// this should have been set to a default value of worker-name-class-name if unspecified by the user
+	if (containerApp.name === undefined) {
+		throw new FatalError("Container application name failed to be set", 1, {
+			telemetryMessage: true,
+		});
+	}
+
 	const app: CreateApplicationRequest = {
 		...containerApp,
-		configuration,
+		name: containerApp.name,
+		configuration: {
+			...configuration,
+			// De-sugar image name
+			image: resolveImageName(accountId, configuration.image),
+		},
 		instances: containerApp.instances ?? 0,
 		scheduling_policy:
 			(containerApp.scheduling_policy as SchedulingPolicy) ??
-			SchedulingPolicy.REGIONAL,
+			SchedulingPolicy.DEFAULT,
 		constraints: {
 			...(containerApp.constraints ??
 				(!skipDefaults ? { tier: 1 } : undefined)),
@@ -140,181 +263,17 @@ function containerAppToCreateApplication(
 	delete (app as Record<string, unknown>)["image_vars"];
 	delete (app as Record<string, unknown>)["rollout_step_percentage"];
 	delete (app as Record<string, unknown>)["rollout_kind"];
+	delete (app as Record<string, unknown>)["instance_type"];
 
 	return app;
 }
 
-function isNumber(c: string | number) {
-	if (typeof c === "number") {
-		return true;
-	}
-	const code = c.charCodeAt(0);
-	const zero = "0".charCodeAt(0);
-	const nine = "9".charCodeAt(0);
-	return code >= zero && code <= nine;
-}
-
-/**
- * createLine takes a string and goes through each character, rendering possibly syntax highlighting.
- * Useful to render TOML files.
- */
-function createLine(el: string, startWith = ""): string {
-	let line = startWith;
-	let lastAdded = 0;
-	const addToLine = (i: number, color = (s: string) => s) => {
-		line += color(el.slice(lastAdded, i));
-		lastAdded = i;
-	};
-
-	const state = {
-		render: "left" as "quotes" | "number" | "left" | "right" | "section",
-	};
-	for (let i = 0; i < el.length; i++) {
-		const current = el[i];
-		const peek = i + 1 < el.length ? el[i + 1] : null;
-		const prev = i === 0 ? null : el[i - 1];
-
-		switch (state.render) {
-			case "left":
-				if (current === "=") {
-					state.render = "right";
-				}
-
-				break;
-			case "right":
-				if (current === '"') {
-					addToLine(i);
-					state.render = "quotes";
-					break;
-				}
-
-				if (isNumber(current)) {
-					addToLine(i);
-					state.render = "number";
-					break;
-				}
-
-				if (current === "[" && peek === "[") {
-					state.render = "section";
-				}
-
-				break;
-			case "quotes":
-				if (current === '"') {
-					addToLine(i + 1, brandColor);
-					state.render = "right";
-				}
-
-				break;
-			case "number":
-				if (!isNumber(el)) {
-					addToLine(i, red);
-					state.render = "right";
-				}
-
-				break;
-			case "section":
-				if (current === "]" && prev === "]") {
-					addToLine(i + 1);
-					state.render = "right";
-				}
-		}
-	}
-
-	switch (state.render) {
-		case "left":
-			addToLine(el.length);
-			break;
-		case "right":
-			addToLine(el.length);
-			break;
-		case "quotes":
-			addToLine(el.length, brandColor);
-			break;
-		case "number":
-			addToLine(el.length, red);
-			break;
-		case "section":
-			// might be unreachable
-			addToLine(el.length, bold);
-			break;
-	}
-
-	return line;
-}
-
-/**
- * printLine takes a line and prints it by using createLine and use printFunc
- */
-function printLine(el: string, startWith = "", printFunc = log) {
-	printFunc(createLine(el, startWith));
-}
-
-/**
- * Removes from the object every undefined property
- */
-function stripUndefined<T = Record<string, unknown>>(r: T): T {
-	for (const k in r) {
-		if (r[k] === undefined) {
-			delete r[k];
-		}
-	}
-
-	return r;
-}
-
-/**
- * Take an object and sort its keys in alphabetical order.
- */
-function sortObjectKeys(unordered: Record<string | number, unknown>) {
-	if (Array.isArray(unordered)) {
-		return unordered;
-	}
-
-	return Object.keys(unordered)
-		.sort()
-		.reduce(
-			(obj, key) => {
-				obj[key] = unordered[key];
-				return obj;
-			},
-			{} as Record<string, unknown>
-		);
-}
-
-/**
- * Take an object and sort its keys in alphabetical order recursively.
- * Useful to normalize objects so they can be compared when rendered.
- * It will copy the object and not mutate it.
- */
-function sortObjectRecursive<T = Record<string | number, unknown>>(
-	object: Record<string | number, unknown> | Record<string | number, unknown>[]
-): T {
-	if (typeof object !== "object") {
-		return object;
-	}
-
-	if (Array.isArray(object)) {
-		return object.map((obj) => sortObjectRecursive(obj)) as T;
-	}
-
-	const objectCopy: Record<string | number, unknown> = { ...object };
-	for (const [key, value] of Object.entries(object)) {
-		if (typeof value === "object") {
-			if (value === null) {
-				continue;
-			}
-			objectCopy[key] = sortObjectRecursive(
-				value as Record<string, unknown>
-			) as unknown;
-		}
-	}
-
-	return sortObjectKeys(objectCopy) as T;
-}
-
 export async function apply(
-	args: { skipDefaults: boolean | undefined; json: boolean; env?: string },
+	args: {
+		skipDefaults: boolean | undefined;
+		env?: string;
+		imageUpdateRequired?: boolean;
+	},
 	config: Config
 ) {
 	startSection(
@@ -333,6 +292,7 @@ export async function apply(
 			image: "docker.io/cloudflare/hello-world:1.0",
 			instances: 2,
 			name: config.name ?? "my-containers-application",
+			instance_type: "dev",
 		};
 		const endConfig: JsonMap =
 			args.env !== undefined
@@ -350,7 +310,10 @@ export async function apply(
 
 	const applications = await promiseSpinner(
 		ApplicationsService.listApplications(),
-		{ json: args.json, message: "Loading applications" }
+		{ message: "Loading applications" }
+	);
+	applications.forEach((app) =>
+		cleanupObservability(app.configuration.observability)
 	);
 	const applicationByNames: Record<ApplicationName, Application> = {};
 	// TODO: this is not correct right now as there can be multiple applications
@@ -377,18 +340,44 @@ export async function apply(
 	log(dim("Container application changes\n"));
 
 	for (const appConfigNoDefaults of config.containers) {
+		const application =
+			applicationByNames[
+				appConfigNoDefaults.name ??
+					// we should never actually reach this point, but just in case
+					`${config.name}-${appConfigNoDefaults.class_name}`
+			];
+
+		// while configuration.image is deprecated to the user, we still resolve to this for now.
+		if (!appConfigNoDefaults.configuration?.image && application) {
+			appConfigNoDefaults.configuration ??= {};
+		}
+
+		if (!args.imageUpdateRequired && application) {
+			appConfigNoDefaults.configuration ??= {};
+			appConfigNoDefaults.configuration.image = application.configuration.image;
+		}
+
+		const accountId = config.account_id || (await getAccountId(config));
 		const appConfig = containerAppToCreateApplication(
+			accountId,
 			appConfigNoDefaults,
+			config.observability,
+			application,
 			args.skipDefaults
 		);
 
-		const application = applicationByNames[appConfig.name];
 		if (application !== undefined && application !== null) {
 			// we need to sort the objects (by key) because the diff algorithm works with
 			// lines
 			const prevApp = sortObjectRecursive<CreateApplicationRequest>(
-				stripUndefined(applicationToCreateApplication(application))
+				stripUndefined(applicationToCreateApplication(accountId, application))
 			);
+
+			// fill up fields that their defaults were changed over-time,
+			// maintaining retrocompatibility with the existing app
+			if (appConfigNoDefaults.scheduling_policy === undefined) {
+				appConfig.scheduling_policy = prevApp.scheduling_policy;
+			}
 
 			if (
 				prevApp.durable_objects !== undefined &&
@@ -402,20 +391,22 @@ export async function apply(
 				);
 			}
 
+			const prevContainer =
+				appConfig.configuration.instance_type !== undefined
+					? cleanForInstanceType(prevApp)
+					: (prevApp as ContainerApp);
+			const nowContainer = mergeDeep(
+				prevContainer as CreateApplicationRequest,
+				sortObjectRecursive<CreateApplicationRequest>(appConfig)
+			) as ContainerApp;
+
 			const prev = formatConfigSnippet(
-				{ containers: [prevApp as ContainerApp] },
+				{ containers: [prevContainer] },
 				config.configPath
 			);
 
 			const now = formatConfigSnippet(
-				{
-					containers: [
-						mergeDeep(
-							prevApp,
-							sortObjectRecursive<CreateApplicationRequest>(appConfig)
-						) as ContainerApp,
-					],
-				},
+				{ containers: [nowContainer] },
 				config.configPath
 			);
 			const results = diffLines(prev, now);
@@ -564,20 +555,6 @@ export async function apply(
 		return;
 	}
 
-	const yes = await processArgument<boolean>(
-		{ confirm: args.json ? true : undefined },
-		"confirm",
-		{
-			type: "confirm",
-			question: "Do you want to apply these changes?",
-			label: "",
-		}
-	);
-	if (!yes) {
-		cancel("Not applying changes");
-		return;
-	}
-
 	function formatError(err: ApiError): string {
 		// TODO: this is bad bad. Please fix like we do in create.ts.
 		// On Cloudchamber API side, we have to improve as well the object validation errors,
@@ -594,7 +571,11 @@ export async function apply(
 			return message;
 		}
 
-		return `  ${err.body.error}`;
+		if (err.body.error !== undefined) {
+			return `  ${err.body.error}`;
+		}
+
+		return JSON.stringify(err.body);
 	}
 
 	for (const action of actions) {
@@ -603,7 +584,7 @@ export async function apply(
 			try {
 				application = await promiseSpinner(
 					ApplicationsService.createApplication(action.application),
-					{ json: args.json, message: `creating ${action.application.name}` }
+					{ message: `Creating ${action.application.name}` }
 				);
 			} catch (err) {
 				if (!(err instanceof Error)) {
@@ -647,8 +628,8 @@ export async function apply(
 							action.application.max_instances !== undefined
 								? undefined
 								: action.application.instances,
-						configuration: undefined,
-					})
+					}),
+					{ message: `Modifying ${action.application.name}` }
 				);
 			} catch (err) {
 				if (!(err instanceof Error)) {
@@ -685,7 +666,6 @@ export async function apply(
 							kind: action.rollout_kind,
 						}),
 						{
-							json: args.json,
 							message: `rolling out container version ${action.name}`,
 						}
 					);
@@ -729,11 +709,17 @@ export async function apply(
  * detects.
  */
 export async function applyCommand(
-	args: StrictYargsOptionsToInterfaceJSON<typeof applyCommandOptionalYargs>,
+	args: StrictYargsOptionsToInterface<typeof applyCommandOptionalYargs>,
 	config: Config
 ) {
 	return apply(
-		{ skipDefaults: args.skipDefaults, env: args.env, json: args.json },
+		{
+			skipDefaults: args.skipDefaults,
+			env: args.env,
+			// For the apply command we want this to default to true
+			// so that the image can be updated if the user modified it.
+			imageUpdateRequired: true,
+		},
 		config
 	);
 }
